@@ -66,53 +66,47 @@ def listar_videos_canal(canal_url):
     return videos
 
 
-def obtener_subtitulos_ytdlp(video_id):
+def obtener_subtitulos_rapido(video_id):
     patron_salida = f"/tmp/sub_{video_id}"
     for f in glob.glob(f"{patron_salida}*"):
         os.remove(f)
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    clientes = ["android,tv", "ios,mweb", "default"]
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--write-auto-subs",
+        "--write-subs",
+        "--sub-langs", "es.*,es,en",
+        "--sub-format", "json3",
+        "--no-warnings",
+        "--extractor-args", "youtube:player_client=android,tv",
+        "-o", patron_salida,
+        url,
+    ]
+    subprocess.run(cmd, capture_output=True, text=True)
+    archivos = glob.glob(f"{patron_salida}*.json3")
+    if not archivos:
+        return []
 
-    for cliente in clientes:
-        cmd = [
-            "yt-dlp",
-            "--skip-download",
-            "--write-auto-subs",
-            "--write-subs",
-            "--sub-langs", "es.*,es,en",
-            "--sub-format", "json3",
-            "--no-warnings",
-            "-o", patron_salida,
-        ]
-        if cliente != "default":
-            cmd.extend(["--extractor-args", f"youtube:player_client={cliente}"])
-        cmd.append(url)
+    archivos.sort(key=lambda x: 0 if ".es" in os.path.basename(x) else 1)
+    with open(archivos[0], "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for a in archivos:
+        os.remove(a)
 
-        subprocess.run(cmd, capture_output=True, text=True)
-        archivos = glob.glob(f"{patron_salida}*.json3")
-        if archivos:
-            archivos.sort(key=lambda x: 0 if ".es" in os.path.basename(x) else 1)
-            with open(archivos[0], "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for a in archivos:
-                os.remove(a)
-
-            segmentos = []
-            for ev in data.get("events", []):
-                segs = ev.get("segs")
-                if not segs:
-                    continue
-                texto = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
-                if texto:
-                    segmentos.append({
-                        "text": texto,
-                        "start": ev.get("tStartMs", 0) / 1000.0
-                    })
-            if segmentos:
-                return segmentos
-
-    return []
+    segmentos = []
+    for ev in data.get("events", []):
+        segs = ev.get("segs")
+        if not segs:
+            continue
+        texto = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
+        if texto:
+            segmentos.append({
+                "text": texto,
+                "start": ev.get("tStartMs", 0) / 1000.0
+            })
+    return segmentos
 
 
 def trocear_transcripcion(video_id, titulo, canal, descripcion, segmentos):
@@ -171,21 +165,31 @@ def trocear_transcripcion(video_id, titulo, canal, descripcion, segmentos):
 
 def generar_vectores(textos):
     vectores = []
-    for i in range(0, len(textos), 50):
-        lote = textos[i:i + 50]
-        res = client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=lote,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=768
-            )
-        )
-        for emb in res.embeddings:
-            v = np.array(emb.values, dtype=np.float32)
-            v = v / (np.linalg.norm(v) + 1e-10)
-            vectores.append(v)
-        time.sleep(1.5)
+    for i in range(0, len(textos), 40):
+        lote = textos[i:i + 40]
+        while True:
+            try:
+                res = client.models.embed_content(
+                    model="gemini-embedding-001",
+                    contents=lote,
+                    config=types.EmbedContentConfig(
+                        task_type="RETRIEVAL_DOCUMENT",
+                        output_dimensionality=768
+                    )
+                )
+                for emb in res.embeddings:
+                    v = np.array(emb.values, dtype=np.float32)
+                    v = v / (np.linalg.norm(v) + 1e-10)
+                    vectores.append(v)
+                break
+            except Exception as e:
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    print("Pausa de 35s para respetar el límite gratuito de Google...")
+                    time.sleep(35)
+                else:
+                    raise
+        if i + 40 < len(textos):
+            time.sleep(30)
     return np.array(vectores, dtype=np.float32)
 
 
@@ -205,34 +209,40 @@ def main():
         print("Todo al día.")
         return
 
-    nuevos_chunks = []
-    procesados_este_turno = 0
+    fallos_seguidos_subs = 0
+    subtitulos_disponibles = True
+    lote_chunks = []
 
-    for video in pendientes:
+    for idx, video in enumerate(pendientes, start=1):
         vid = video["id"]
         titulo = video["title"]
         canal = video["channel"]
         desc = video.get("description", "")
 
-        segs = obtener_subtitulos_ytdlp(vid)
+        segs = []
+        if subtitulos_disponibles:
+            segs = obtener_subtitulos_rapido(vid)
+            if segs:
+                fallos_seguidos_subs = 0
+            else:
+                fallos_seguidos_subs += 1
+                if fallos_seguidos_subs >= 3:
+                    subtitulos_disponibles = False
+                    print("YouTube bloquea subtítulos desde esta IP; indexando títulos y descripciones rápido...")
+
         trozos = trocear_transcripcion(vid, titulo, canal, desc, segs)
+        lote_chunks.extend(trozos)
+        print(f"[{idx}/{len(pendientes)}] OK [{canal}]: {titulo}")
 
-        if trozos:
-            nuevos_chunks.extend(trozos)
-            estado = f"{len(trozos)} bloques con subtítulos" if segs else "título y descripción"
-            print(f"OK [{canal}]: {titulo} ({estado})")
-
-        procesados_este_turno += 1
-        time.sleep(0.8)
-
-        if len(nuevos_chunks) >= 150 or procesados_este_turno == len(pendientes):
-            if nuevos_chunks:
-                nuevos_vecs = generar_vectores([c["text"] for c in nuevos_chunks])
-                chunks.extend(nuevos_chunks)
-                embeddings = np.vstack([embeddings, nuevos_vecs]) if embeddings.size else nuevos_vecs
-                nuevos_chunks = []
+        if len(lote_chunks) >= 40 or idx == len(pendientes):
+            nuevos_vecs = generar_vectores([c["text"] for c in lote_chunks])
+            chunks.extend(lote_chunks)
+            embeddings = np.vstack([embeddings, nuevos_vecs]) if embeddings.size else nuevos_vecs
+            lote_chunks = []
             guardar_estado(chunks, embeddings, ignorados)
-            print("Progreso guardado.")
+            print(f"Guardado en biblioteca ({len({c['video_id'] for c in chunks})} vídeos totales).")
+            if idx < len(pendientes):
+                time.sleep(30)
 
 
 if __name__ == "__main__":
