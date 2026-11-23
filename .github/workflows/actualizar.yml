@@ -1,0 +1,37 @@
+name: Actualizar biblioteca de videos
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar librerías
+        run: pip install -r requirements.txt
+
+      - name: Buscar vídeos nuevos e indexar
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python actualizar.py
+
+      - name: Guardar cambios en la biblioteca
+        run: |
+          git config user.name "Buscador Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add datos/
+          git diff --staged --quiet || git commit -m "Actualizar biblioteca de vídeos"
+          git push
