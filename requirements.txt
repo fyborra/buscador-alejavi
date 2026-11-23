@@ -1,0 +1,5 @@
+streamlit
+numpy
+yt-dlp
+youtube-transcript-api
+google-genai
