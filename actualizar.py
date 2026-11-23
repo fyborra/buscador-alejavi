@@ -1,9 +1,9 @@
 import os
 import json
 import time
+import glob
 import subprocess
 import numpy as np
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from google import genai
 from google.genai import types
 
@@ -59,24 +59,74 @@ def listar_videos_canal(canal_url):
             videos.append({
                 "id": e["id"],
                 "title": e["title"],
-                "channel": nombre_canal
+                "channel": nombre_canal,
+                "description": e.get("description") or ""
             })
     videos.reverse()
     return videos
 
 
-def obtener_subtitulos(video_id):
-    idiomas = ["es", "es-ES", "es-419", "en"]
-    try:
-        return YouTubeTranscriptApi.get_transcript(video_id, languages=idiomas)
-    except AttributeError:
-        ytt = YouTubeTranscriptApi()
-        fetched = ytt.fetch(video_id, languages=idiomas)
-        return [{"text": s.text, "start": s.start} for s in fetched]
+def obtener_subtitulos_ytdlp(video_id):
+    patron_salida = f"/tmp/sub_{video_id}"
+    for f in glob.glob(f"{patron_salida}*"):
+        os.remove(f)
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    clientes = ["android,tv", "ios,mweb", "default"]
+
+    for cliente in clientes:
+        cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-auto-subs",
+            "--write-subs",
+            "--sub-langs", "es.*,es,en",
+            "--sub-format", "json3",
+            "--no-warnings",
+            "-o", patron_salida,
+        ]
+        if cliente != "default":
+            cmd.extend(["--extractor-args", f"youtube:player_client={cliente}"])
+        cmd.append(url)
+
+        subprocess.run(cmd, capture_output=True, text=True)
+        archivos = glob.glob(f"{patron_salida}*.json3")
+        if archivos:
+            archivos.sort(key=lambda x: 0 if ".es" in os.path.basename(x) else 1)
+            with open(archivos[0], "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for a in archivos:
+                os.remove(a)
+
+            segmentos = []
+            for ev in data.get("events", []):
+                segs = ev.get("segs")
+                if not segs:
+                    continue
+                texto = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
+                if texto:
+                    segmentos.append({
+                        "text": texto,
+                        "start": ev.get("tStartMs", 0) / 1000.0
+                    })
+            if segmentos:
+                return segmentos
+
+    return []
 
 
-def trocear_transcripcion(video_id, titulo, canal, segmentos):
+def trocear_transcripcion(video_id, titulo, canal, descripcion, segmentos):
     trozos = []
+
+    if descripcion.strip():
+        trozos.append({
+            "video_id": video_id,
+            "title": titulo,
+            "channel": canal,
+            "start": 0,
+            "text": f"{titulo}. {descripcion.strip()[:1200]}"
+        })
+
     texto_actual = ""
     inicio_actual = 0
 
@@ -105,6 +155,15 @@ def trocear_transcripcion(video_id, titulo, canal, segmentos):
             "channel": canal,
             "start": inicio_actual,
             "text": texto_actual.strip()
+        })
+
+    if not trozos:
+        trozos.append({
+            "video_id": video_id,
+            "title": titulo,
+            "channel": canal,
+            "start": 0,
+            "text": titulo
         })
 
     return trozos
@@ -153,22 +212,18 @@ def main():
         vid = video["id"]
         titulo = video["title"]
         canal = video["channel"]
-        try:
-            segs = obtener_subtitulos(vid)
-            trozos = trocear_transcripcion(vid, titulo, canal, segs)
-            if trozos:
-                nuevos_chunks.extend(trozos)
-                print(f"OK [{canal}]: {titulo} ({len(trozos)} bloques)")
-            else:
-                ignorados.add(vid)
-        except (TranscriptsDisabled, NoTranscriptFound):
-            print(f"Sin subtítulos: {titulo}")
-            ignorados.add(vid)
-        except Exception as e:
-            print(f"Aviso temporal con {titulo}: {e}")
+        desc = video.get("description", "")
+
+        segs = obtener_subtitulos_ytdlp(vid)
+        trozos = trocear_transcripcion(vid, titulo, canal, desc, segs)
+
+        if trozos:
+            nuevos_chunks.extend(trozos)
+            estado = f"{len(trozos)} bloques con subtítulos" if segs else "título y descripción"
+            print(f"OK [{canal}]: {titulo} ({estado})")
 
         procesados_este_turno += 1
-        time.sleep(1.2)
+        time.sleep(0.8)
 
         if len(nuevos_chunks) >= 150 or procesados_este_turno == len(pendientes):
             if nuevos_chunks:
